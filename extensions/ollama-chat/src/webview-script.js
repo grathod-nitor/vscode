@@ -373,8 +373,26 @@ window.addEventListener('message', (event) => {
 		if (currentAssistantEl) {
 			const parent = currentAssistantEl.parentElement;
 
-			// Clear the assistant message content - we'll show only the diff
-			currentAssistantEl.textContent = '';
+			// Keep the explanation text but remove the code block from it
+			// if we're showing it as a diff. This ensures explanation is in one div
+			// and the code changes (in the diff view) are in another.
+			let text = currentAssistantEl.textContent || '';
+			if (text.includes('```')) {
+				// We use a regex to strip out the code blocks from the explanation text
+				// as they will be displayed more beautifully in the diff container below.
+				const parts = text.split(/```[\s\S]*?```/);
+				text = parts.filter(p => p.trim().length > 0).join('\n\n').trim();
+				currentAssistantEl.textContent = text;
+			}
+
+			// If no explanation is left (e.g., model only sent code), show nothing in the text div
+			// to avoid a "blank box" with padding.
+			if (!text || text.trim().length === 0) {
+				currentAssistantEl.style.display = 'none';
+			} else {
+				currentAssistantEl.style.display = 'block';
+			}
+
 
 			// Create diff view with modern styling
 			const diff = document.createElement('div');

@@ -6,6 +6,8 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { applySmartPatch, extractFunctionOrBlock, findFunctionOrBlockByMarker } from './codePatcher';
+import { ContextManager } from './contextManager';
+
 
 const DEFAULT_OLLAMA_BASE = 'http://localhost:11434';
 const STORAGE_KEY_MODEL = 'ollama.selectedModel';
@@ -16,6 +18,17 @@ const STORAGE_KEY_MAX_TOKENS = 'ollama.maxTokens';
 
 export function activate(context: vscode.ExtensionContext) {
 	const provider = new OllamaChatViewProvider(context);
+
+	// NEW: Initialize Context Manager
+	const contextManager = new ContextManager(context);
+	// Start analysis in background (don't await to avoid blocking activation)
+	contextManager.initialize().catch(err => {
+		console.error('Failed to initialize repository context:', err);
+	});
+
+	// Pass manager to provider
+	provider.setContextManager(contextManager);
+
 
 	context.subscriptions.push(
 		vscode.window.registerWebviewViewProvider(
@@ -107,9 +120,17 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 	private topP: number = 0.9;
 	private maxTokens: number = 2048;
 
+	// NEW: Context Manager reference
+	private contextManager?: ContextManager;
+
 	constructor(private readonly context: vscode.ExtensionContext) {
 		this.loadSettings();
 		this.loadSelectedModel();
+	}
+
+	// NEW: Setter for Context Manager
+	public setContextManager(manager: ContextManager) {
+		this.contextManager = manager;
 	}
 
 	private loadSettings() {
@@ -458,8 +479,16 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	suggestChanges(code: string, prompt: string, editor: vscode.TextEditor) {
-		const fullPrompt = `Analyze the following code and ${prompt}\n\nCode:\n\`\`\`\n${code}\n\`\`\`\n\nProvide the updated complete code only, without explanations.`;
+
+		// NEW: Add context to suggestions
+		let contextBlock = '';
+		if (this.contextManager) {
+			contextBlock = this.contextManager.getContextString();
+		}
+
+		const fullPrompt = `Repository Context:\n${contextBlock}\n\nAnalyze the following code and ${prompt}\n\nCode:\n\`\`\`\n${code}\n\`\`\`\n\nProvide the updated complete code only, without explanations.`;
 		const id = Date.now().toString(36);
+
 
 		this.post({
 			type: 'addMessage',
@@ -497,7 +526,30 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 
 		// If file is selected, include file context in the prompt
 		let enhancedPrompt = prompt;
-		if (filePath) {
+		// 1. Get Project Context
+		if (this.contextManager) {
+			const projectContext = this.contextManager.getContextString();
+
+			// 2. Get Related Files (if we have a target file)
+			let relatedFiles = '';
+			if (filePath) {
+				relatedFiles = this.contextManager.getRelatedCode(filePath);
+			}
+
+			// 3. Get Specific File Content (if selected)
+			let fileContext = '';
+			if (filePath) {
+				try {
+					const fileContent = fs.readFileSync(filePath, 'utf8');
+					const fileName = path.basename(filePath);
+					fileContext = `Active File: ${fileName}\nContent:\n\`\`\`\n${fileContent}\n\`\`\`\n`;
+				} catch (err) {
+					console.warn('Failed to read file for context:', err);
+				}
+			}
+
+			enhancedPrompt = `REPOSITORY CONTEXT:\n${projectContext}\n\n${relatedFiles}\n\n${fileContext}\n\nUSER REQUEST:\n${prompt}\n\nPlease provide code or answer based on the context above.`;
+		} else if (filePath) {
 			try {
 				const fileContent = fs.readFileSync(filePath, 'utf8');
 				const fileName = path.basename(filePath);
