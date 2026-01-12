@@ -1,0 +1,61 @@
+{
+  "name": "ollama-chat",
+  "displayName": "Ollama Chat",
+  "description": "Chat with local Ollama models",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["AI"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ollama.openChat",
+        "title": "Open Ollama Chat"
+      },
+      {
+        "command": "ollama.suggestChanges",
+        "title": "Ollama: Suggest Code Changes"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ollamaChat",
+          "title": "Ollama",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ollamaChat": [
+        {
+          "id": "ollamaChat.view",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Ollama",
+      "properties": {
+        "ollama.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Ollama server URL"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}

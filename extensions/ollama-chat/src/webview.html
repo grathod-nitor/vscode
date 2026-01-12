@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8" />
+	<meta http-equiv="Content-Security-Policy"
+		content="default-src 'none';
+				img-src https: data:;
+				style-src 'unsafe-inline';
+				script-src 'nonce-${nonce}';">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<title>Ollama Chat</title>
+
+	<style>
+	* {
+		box-sizing: border-box;
+		margin: 0;
+		padding: 0;
+	}
+
+	:root {
+		--bg: var(--vscode-sideBar-background);
+		--fg: var(--vscode-sideBar-foreground);
+		--border: var(--vscode-sideBar-border);
+		--input-bg: var(--vscode-input-background);
+		--input-fg: var(--vscode-input-foreground);
+		--accent: var(--vscode-button-background);
+		--user-bg: rgba(0, 122, 204, 0.15);
+		--assistant-bg: rgba(128, 128, 128, 0.08);
+		--file-badge: rgba(0, 122, 204, 0.2);
+	}
+
+	html, body {
+		height: 100%;
+		margin: 0;
+		padding: 0;
+		background: var(--bg);
+		color: var(--fg);
+		font-family: var(--vscode-font-family);
+		font-size: 13px;
+	}
+
+	#root {
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+	}
+
+	/* Header */
+	.chat-header {
+		display: flex;
+		align-items: center;
+		padding: 10px 16px;
+		border-bottom: 1px solid var(--border);
+		gap: 12px;
+		flex-shrink: 0;
+		background: var(--bg);
+	}
+
+	.chat-title {
+		flex: 1;
+		font-weight: 600;
+		font-size: 13px;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.chat-title::before {
+		/*allow-any-unicode-next-line*/
+		content: '🤖';
+		font-size: 16px;
+	}
+
+	#tokenUsage {
+		font-size: 11px;
+		color: var(--vscode-descriptionForeground);
+		padding: 4px 8px;
+		background: rgba(128, 128, 128, 0.1);
+		border-radius: 4px;
+	}
+
+	.header-icon {
+		width: 28px;
+		height: 28px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		cursor: pointer;
+		color: var(--fg);
+		border-radius: 4px;
+		border: 1px solid transparent;
+		transition: all 0.2s;
+	}
+
+	.header-icon:hover {
+		background: var(--assistant-bg);
+		border-color: var(--border);
+	}
+
+	/* Messages Container */
+	#messages {
+		flex: 1;
+		overflow-y: auto;
+		padding: 16px;
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+	}
+
+	.message-group {
+		display: flex;
+		gap: 12px;
+		animation: slideIn 0.3s ease-out;
+	}
+
+	@keyframes slideIn {
+		from {
+			opacity: 0;
+			transform: translateY(8px);
+		}
+		to {
+			opacity: 1;
+			transform: translateY(0);
+		}
+	}
+
+	.message-avatar {
+		width: 32px;
+		height: 32px;
+		border-radius: 50%;
+		flex-shrink: 0;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 18px;
+		background: var(--assistant-bg);
+		border: 2px solid var(--border);
+	}
+
+	.message-group.user .message-avatar {
+		background: rgba(0, 122, 204, 0.2);
+		border-color: rgba(0, 122, 204, 0.4);
+	}
+
+	.message-group.user .message-avatar::before {
+		/*allow-any-unicode-next-line*/
+		content: '👤';
+	}
+
+	.message-group.assistant .message-avatar::before {
+		/*allow-any-unicode-next-line*/
+		content: '🤖';
+	}
+
+	.message-content {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.message {
+		padding: 12px 16px;
+		border-radius: 8px;
+		line-height: 1.6;
+		word-wrap: break-word;
+		white-space: pre-wrap;
+	}
+
+	.message-group.user .message {
+		background: var(--user-bg);
+		margin-left: auto;
+		max-width: 85%;
+		border-top-right-radius: 4px;
+	}
+
+	.message-group.assistant .message {
+		background: var(--assistant-bg);
+		max-width: 90%;
+		border-top-left-radius: 4px;
+	}
+
+	/* File Badge */
+	.file-badge {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		padding: 4px 10px;
+		margin-bottom: 8px;
+		background: var(--file-badge);
+		border-radius: 12px;
+		font-size: 11px;
+		font-weight: 500;
+		color: var(--accent);
+	}
+
+	.file-badge::before {
+		/*allow-any-unicode-next-line*/
+		content: '📄';
+		font-size: 12px;
+	}
+
+	/* Code Actions */
+	.code-action-buttons {
+		display: flex;
+		gap: 8px;
+		margin-top: 12px;
+	}
+
+	.code-action-buttons button {
+		padding: 6px 12px;
+		font-size: 12px;
+		background: var(--accent);
+		color: white;
+		border: none;
+		border-radius: 6px;
+		cursor: pointer;
+		transition: all 0.2s;
+		font-weight: 500;
+	}
+
+	.code-action-buttons button:hover {
+		opacity: 0.9;
+		transform: translateY(-1px);
+	}
+
+	.code-action-buttons button[data-action="discard"] {
+		background: transparent;
+		border: 1px solid var(--border);
+		color: var(--fg);
+	}
+
+	.code-action-buttons button[data-action="discard"]:hover {
+		background: rgba(255, 100, 100, 0.1);
+		border-color: rgba(255, 100, 100, 0.5);
+	}
+
+	/* Code Diff */
+	.code-diff {
+		margin-top: 12px;
+		border: 1px solid var(--border);
+		padding: 12px;
+		border-radius: 8px;
+		max-height: 400px;
+		overflow: auto;
+		background: var(--input-bg);
+		font-family: 'Courier New', monospace;
+		font-size: 12px;
+	}
+
+	.diff-line {
+		display: block;
+		white-space: pre;
+		padding: 2px 4px;
+		margin: 1px 0;
+	}
+
+	.diff-added {
+		background: rgba(46, 160, 67, 0.15);
+		color: #2ea043;
+	}
+
+	.diff-removed {
+		background: rgba(248, 81, 73, 0.15);
+		color: #f85149;
+		text-decoration: line-through;
+	}
+
+	/* Input Container */
+	#inputContainer {
+		padding: 16px;
+		border-top: 1px solid var(--border);
+		background: var(--bg);
+		flex-shrink: 0;
+	}
+
+	/* File Selector in Input */
+	.file-selector-inline {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin-bottom: 12px;
+		padding: 8px 12px;
+		background: var(--assistant-bg);
+		border-radius: 6px;
+		border: 1px solid var(--border);
+	}
+
+	.file-selector-inline label {
+		font-size: 11px;
+		font-weight: 600;
+		color: var(--vscode-descriptionForeground);
+		white-space: nowrap;
+	}
+
+	.file-selector-inline select {
+		flex: 1;
+		padding: 4px 8px;
+		border-radius: 4px;
+		border: 1px solid var(--border);
+		background: var(--input-bg);
+		color: var(--input-fg);
+		font-family: inherit;
+		font-size: 12px;
+	}
+
+	.file-selector-inline select:hover {
+		border-color: var(--accent);
+	}
+
+	/* Model Selector */
+	.model-selector-inline {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin-bottom: 12px;
+		padding: 8px 12px;
+		background: var(--assistant-bg);
+		border-radius: 6px;
+		border: 1px solid var(--border);
+	}
+
+	.model-selector-inline label {
+		font-size: 11px;
+		font-weight: 600;
+		color: var(--vscode-descriptionForeground);
+		white-space: nowrap;
+	}
+
+	.model-selector-inline select {
+		flex: 1;
+		padding: 4px 8px;
+		border-radius: 4px;
+		border: 1px solid var(--border);
+		background: var(--input-bg);
+		color: var(--input-fg);
+		font-family: inherit;
+		font-size: 12px;
+	}
+
+	.model-selector-inline button {
+		padding: 4px 8px;
+		background: transparent;
+		border: 1px solid var(--border);
+		color: var(--fg);
+		cursor: pointer;
+		border-radius: 4px;
+		font-size: 12px;
+		transition: all 0.2s;
+	}
+
+	.model-selector-inline button:hover {
+		background: var(--accent);
+		color: white;
+		border-color: var(--accent);
+	}
+
+	#modelDetails {
+		font-size: 11px;
+		color: var(--vscode-descriptionForeground);
+		margin-top: 4px;
+		padding-left: 12px;
+	}
+
+	/* Input Bar */
+	#inputBar {
+		display: flex;
+		gap: 8px;
+		align-items: flex-end;
+		position: relative;
+	}
+
+	#prompt {
+		flex: 1;
+		border-radius: 8px;
+		border: 1px solid var(--border);
+		padding: 12px 16px;
+		background: var(--input-bg);
+		color: var(--input-fg);
+		font-family: inherit;
+		font-size: 13px;
+		min-height: 44px;
+		max-height: 200px;
+		overflow-y: auto;
+		resize: none;
+		transition: all 0.2s;
+	}
+
+	#prompt::placeholder {
+		color: var(--vscode-input-placeholderForeground);
+	}
+
+	#prompt:focus {
+		outline: none;
+		border-color: var(--accent);
+		box-shadow: 0 0 0 2px rgba(0, 122, 204, 0.1);
+	}
+
+	#send {
+		width: 44px;
+		height: 44px;
+		border-radius: 8px;
+		border: none;
+		background: var(--accent);
+		color: white;
+		cursor: pointer;
+		font-size: 18px;
+		font-weight: 500;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		transition: all 0.2s;
+		flex-shrink: 0;
+	}
+
+	#send:hover {
+		opacity: 0.9;
+		transform: translateY(-1px);
+	}
+
+	#send:active {
+		transform: translateY(0);
+	}
+
+	#send::before {
+		content: '↑';
+	}
+
+	/* Status */
+	#status {
+		padding: 10px 16px;
+		background: rgba(255, 255, 0, 0.1);
+		border-bottom: 1px solid var(--border);
+		color: var(--fg);
+		font-size: 12px;
+		display: none;
+	}
+
+	/* Settings Modal */
+	.settings-modal {
+		position: fixed;
+		top: 0;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		background: rgba(0, 0, 0, 0.5);
+		display: none;
+		align-items: center;
+		justify-content: center;
+		z-index: 10000;
+	}
+
+	.settings-modal.active {
+		display: flex;
+	}
+
+	.settings-dialog {
+		background: var(--bg);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		padding: 24px;
+		min-width: 500px;
+		max-width: 600px;
+		max-height: 80vh;
+		overflow-y: auto;
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+	}
+
+	.settings-dialog h2 {
+		margin-bottom: 20px;
+		font-size: 18px;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.settings-dialog h2::before {
+		/*allow-any-unicode-next-line*/
+		content: '⚙️';
+	}
+
+	.settings-group {
+		margin-bottom: 20px;
+	}
+
+	.settings-group label {
+		display: block;
+		font-size: 12px;
+		font-weight: 600;
+		margin-bottom: 8px;
+		color: var(--fg);
+	}
+
+	.settings-group input,
+	.settings-group select {
+		width: 100%;
+		padding: 8px 12px;
+		border-radius: 6px;
+		border: 1px solid var(--border);
+		background: var(--input-bg);
+		color: var(--input-fg);
+		font-family: inherit;
+		font-size: 13px;
+	}
+
+	.settings-group input:focus,
+	.settings-group select:focus {
+		outline: none;
+		border-color: var(--accent);
+		box-shadow: 0 0 0 2px rgba(0, 122, 204, 0.1);
+	}
+
+	.settings-group .hint {
+		font-size: 11px;
+		color: var(--vscode-descriptionForeground);
+		margin-top: 4px;
+	}
+
+	.settings-actions {
+		display: flex;
+		gap: 8px;
+		justify-content: flex-end;
+		margin-top: 24px;
+		padding-top: 20px;
+		border-top: 1px solid var(--border);
+	}
+
+	.settings-actions button {
+		padding: 8px 16px;
+		border-radius: 6px;
+		border: none;
+		cursor: pointer;
+		font-family: inherit;
+		font-size: 13px;
+		font-weight: 500;
+		transition: all 0.2s;
+	}
+
+	.settings-actions button.primary {
+		background: var(--accent);
+		color: white;
+	}
+
+	.settings-actions button.secondary {
+		background: transparent;
+		border: 1px solid var(--border);
+		color: var(--fg);
+	}
+
+	.settings-actions button:hover {
+		opacity: 0.9;
+	}
+	</style>
+</head>
+
+<body>
+	<div id="root">
+		<div class="chat-header">
+			<div class="chat-title">Ollama Chat</div>
+			<span id="tokenUsage">Tokens: 0</span>
+			/*allow-any-unicode-next-line*/
+			<button class="header-icon" id="settingsBtn" title="Settings">⚙️</button>
+		</div>
+
+		<div id="status"></div>
+
+		<div id="messages"></div>
+
+		<div id="inputContainer">
+			<div class="model-selector-inline">
+				<label>Model:</label>
+				<select id="modelSelector">
+					<option value="">Loading models...</option>
+				</select>
+				/*allow-any-unicode-next-line*/
+				<button id="refreshBtn" title="Refresh models">↻</button>
+			</div>
+			<div id="modelDetails"></div>
+
+			<div class="file-selector-inline">
+				<label>File:</label>
+				<select id="fileSelector">
+					<option value="">No file selected</option>
+				</select>
+			</div>
+
+			<div id="inputBar">
+				<textarea id="prompt" placeholder="Ask Ollama or request code changes... (Shift+Enter for new line, Enter to send)"></textarea>
+				<button id="send" title="Send message"></button>
+			</div>
+		</div>
+	</div>
+
+	<!-- Settings Modal -->
+	<div id="settingsModal" class="settings-modal">
+		<div class="settings-dialog">
+			<h2>Ollama Settings</h2>
+
+			<div class="settings-group">
+				<label for="settingBaseUrl">Base URL</label>
+				<input type="text" id="settingBaseUrl" placeholder="http://localhost:11434">
+				<div class="hint">The base URL of your Ollama server</div>
+			</div>
+
+			<div class="settings-group">
+				<label for="settingTemperature">Temperature</label>
+				<input type="number" id="settingTemperature" min="0" max="2" step="0.1" value="0.7">
+				<div class="hint">Controls randomness (0.0 = deterministic, 2.0 = very creative)</div>
+			</div>
+
+			<div class="settings-group">
+				<label for="settingTopP">Top P (Nucleus Sampling)</label>
+				<input type="number" id="settingTopP" min="0" max="1" step="0.1" value="0.9">
+				<div class="hint">Consider tokens with top_p probability mass (0.0 to 1.0)</div>
+			</div>
+
+			<div class="settings-group">
+				<label for="settingMaxTokens">Max Tokens</label>
+				<input type="number" id="settingMaxTokens" min="1" max="8192" step="1" value="2048">
+				<div class="hint">Maximum number of tokens to generate in the response</div>
+			</div>
+
+			<div class="settings-actions">
+				<button class="secondary" id="settingsCancel">Cancel</button>
+				<button class="primary" id="settingsSave">Save</button>
+			</div>
+		</div>
+	</div>
+
+	<script nonce="${nonce}" src="./webview-script.js"></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+out/**.map
+src/**
+.vscode/**
+.git/**
+.gitignore
+.gitlab-ci.yml
+build/**
+test/**
+**.md
+.prettierrc.json
+tsconfig.json
