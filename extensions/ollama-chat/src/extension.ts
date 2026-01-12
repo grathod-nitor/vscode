@@ -15,15 +15,26 @@ const STORAGE_KEY_BASE_URL = 'ollama.baseUrl';
 const STORAGE_KEY_TEMPERATURE = 'ollama.temperature';
 const STORAGE_KEY_TOP_P = 'ollama.topP';
 const STORAGE_KEY_MAX_TOKENS = 'ollama.maxTokens';
+const STORAGE_KEY_EMBEDDING_MODEL = 'ollama.embeddingModel';
+const STORAGE_KEY_SELECTED_FILE = 'ollama.selectedFile';
+const STORAGE_KEY_CHATS = 'ollama.chats';
+const STORAGE_KEY_TOKENS = 'ollama.tokens';
 
 export function activate(context: vscode.ExtensionContext) {
+	console.log('Ollama Orbit: Extension activating...');
+	vscode.window.showInformationMessage('Ollama Orbit intelligence is starting...');
+
 	const provider = new OllamaChatViewProvider(context);
 
 	// NEW: Initialize Context Manager
 	const contextManager = new ContextManager(context);
-	// Start analysis in background (don't await to avoid blocking activation)
-	contextManager.initialize().catch(err => {
-		console.error('Failed to initialize repository context:', err);
+
+	// Initial initialization
+	contextManager.initialize().then(() => {
+		console.log('Ollama Orbit: Context Manager initialized successfully.');
+	}).catch(err => {
+		console.error('Ollama Orbit: Failed to initialize repository context:', err);
+		vscode.window.showErrorMessage(`Orbit initialization failed: ${err.message}`);
 	});
 
 	// Pass manager to provider
@@ -40,6 +51,23 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(
 		vscode.commands.registerCommand('ollama.openChat', async () => {
 			await vscode.commands.executeCommand('workbench.view.extension.ollamaChat');
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('ollama.refreshContext', async () => {
+			try {
+				if (contextManager) {
+					vscode.window.showInformationMessage('Refreshing Orbit project context...');
+					await contextManager.refreshContext();
+					vscode.window.showInformationMessage('Orbit context refreshed!');
+				} else {
+					vscode.window.showErrorMessage('Orbit Context Manager not initialized.');
+				}
+			} catch (e) {
+				console.error('Refresh Context failed:', e);
+				vscode.window.showErrorMessage(`Refresh Context failed: ${e instanceof Error ? e.message : String(e)}`);
+			}
 		})
 	);
 
@@ -119,6 +147,8 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 	private temperature: number = 0.7;
 	private topP: number = 0.9;
 	private maxTokens: number = 2048;
+	private embeddingModel: string = '';
+	private chatHistory: any[] = [];
 
 	// NEW: Context Manager reference
 	private contextManager?: ContextManager;
@@ -131,15 +161,32 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 	// NEW: Setter for Context Manager
 	public setContextManager(manager: ContextManager) {
 		this.contextManager = manager;
+		if (this.embeddingModel) {
+			this.contextManager.setEmbeddingModel(this.embeddingModel);
+			this.contextManager.embedder.setBaseUrl(this.ollamaBase);
+		}
+		if (this.selectedModel) {
+			this.contextManager.setChatModel(this.selectedModel, this.ollamaBase);
+		}
 	}
 
 	private loadSettings() {
 		this.ollamaBase = this.context.globalState.get<string>(STORAGE_KEY_BASE_URL) ??
 			vscode.workspace.getConfiguration('ollama').get('baseUrl') ??
 			DEFAULT_OLLAMA_BASE;
+		this.selectedModel = this.context.globalState.get<string>(STORAGE_KEY_MODEL) ?? '';
+		this.selectedFile = this.context.globalState.get<string>(STORAGE_KEY_SELECTED_FILE) ?? '';
 		this.temperature = this.context.globalState.get<number>(STORAGE_KEY_TEMPERATURE) ?? 0.7;
 		this.topP = this.context.globalState.get<number>(STORAGE_KEY_TOP_P) ?? 0.9;
 		this.maxTokens = this.context.globalState.get<number>(STORAGE_KEY_MAX_TOKENS) ?? 2048;
+		this.embeddingModel = this.context.globalState.get<string>(STORAGE_KEY_EMBEDDING_MODEL) ?? '';
+		this.chatHistory = this.context.globalState.get<any[]>(STORAGE_KEY_CHATS) ?? [];
+		this.sessionTokens = this.context.globalState.get<{ input: number; output: number }>(STORAGE_KEY_TOKENS) ?? { input: 0, output: 0 };
+
+		if (this.contextManager) {
+			this.contextManager.setEmbeddingModel(this.embeddingModel);
+			this.contextManager.embedder.setBaseUrl(this.ollamaBase);
+		}
 	}
 
 	private async saveSettings() {
@@ -147,6 +194,10 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 		await this.context.globalState.update(STORAGE_KEY_TEMPERATURE, this.temperature);
 		await this.context.globalState.update(STORAGE_KEY_TOP_P, this.topP);
 		await this.context.globalState.update(STORAGE_KEY_MAX_TOKENS, this.maxTokens);
+		await this.context.globalState.update(STORAGE_KEY_EMBEDDING_MODEL, this.embeddingModel);
+		await this.context.globalState.update(STORAGE_KEY_SELECTED_FILE, this.selectedFile);
+		await this.context.globalState.update(STORAGE_KEY_CHATS, this.chatHistory);
+		await this.context.globalState.update(STORAGE_KEY_TOKENS, this.sessionTokens);
 	}
 
 	private async loadSelectedModel() {
@@ -175,9 +226,26 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 		this.updateOpenFiles();
 		// Send initial token usage
 		this.postTokenUsage();
+		this.postSettings(); // Ensure settings are sent on resolution
 
-		view.webview.onDidReceiveMessage(async msg => {
-			if (msg.command === 'send') {
+		// Restore chat history
+		if (this.chatHistory.length > 0) {
+			this.post({
+				type: 'restoreChat',
+				history: this.chatHistory
+			});
+		}
+
+		view.webview.onDidReceiveMessage(async (msg: any) => {
+			if (msg.command === 'ready') {
+				this.postModels();
+				this.updateOpenFiles();
+				this.postSettings();
+				if (this.chatHistory.length > 0) {
+					this.post({ type: 'restoreChat', history: this.chatHistory });
+				}
+				this.postTokenUsage();
+			} else if (msg.command === 'send') {
 				await this.handleSend(msg.payload.id, msg.payload.prompt, msg.payload.filePath);
 			} else if (msg.command === 'selectModel') {
 				await this.selectModel(msg.payload.model);
@@ -193,6 +261,10 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 				await this.writeToFile(msg.payload.filePath, msg.payload.code, msg.payload.original, msg.payload.diff, msg.payload.operations);
 			} else if (msg.command === 'getSettings') {
 				this.postSettings();
+			} else if (msg.command === 'createFiles') {
+				await this.createRequestedFiles(msg.payload);
+			} else if (msg.command === 'mergeFile') {
+				await this.handleMergeFile(msg.payload.id, msg.payload.path, msg.payload.content);
 			} else if (msg.command === 'updateSettings') {
 				await this.updateSettings(msg.payload);
 			}
@@ -200,7 +272,7 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	updateOpenFiles() {
-		const openFiles = vscode.window.visibleTextEditors.map(editor => ({
+		const openFiles = vscode.window.visibleTextEditors.map((editor: vscode.TextEditor) => ({
 			name: path.basename(editor.document.fileName),
 			path: editor.document.fileName,
 			language: editor.document.languageId
@@ -217,6 +289,7 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 		try {
 			const content = fs.readFileSync(filePath, 'utf8');
 			this.selectedFile = filePath;
+			await this.context.globalState.update(STORAGE_KEY_SELECTED_FILE, filePath);
 			console.log(`Selected file: ${filePath}, size: ${content.length} bytes`);
 
 			this.post({
@@ -265,7 +338,7 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 			await vscode.workspace.fs.writeFile(uri, enc.encode(contentToWrite));
 
 			// Update open editors
-			const editor = vscode.window.visibleTextEditors.find(e => e.document.fileName === filePath);
+			const editor = vscode.window.visibleTextEditors.find((e: vscode.TextEditor) => e.document.fileName === filePath);
 			if (editor) {
 				const edit = new vscode.WorkspaceEdit();
 				edit.replace(
@@ -376,6 +449,7 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 			type: 'models',
 			models: this.availableModels,
 			selectedModel: this.selectedModel,
+			embeddingModel: this.embeddingModel,
 			modelInfos: Object.fromEntries(this.modelInfoCache.entries()),
 			serverVersion: this.serverVersion
 		};
@@ -386,6 +460,9 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 	private async selectModel(model: string) {
 		this.selectedModel = model;
 		await this.context.globalState.update(STORAGE_KEY_MODEL, model);
+		if (this.contextManager) {
+			this.contextManager.setChatModel(this.selectedModel, this.ollamaBase);
+		}
 		// Ensure model info available and post selection
 		await this.fetchModelInfo(model).catch(() => { /* ignore */ });
 		this.post({
@@ -453,13 +530,18 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 			baseUrl: this.ollamaBase,
 			temperature: this.temperature,
 			topP: this.topP,
-			maxTokens: this.maxTokens
+			maxTokens: this.maxTokens,
+			embeddingModel: this.embeddingModel,
+			ollamaBase: this.ollamaBase
 		});
 	}
 
-	private async updateSettings(payload: { baseUrl?: string; temperature?: number; topP?: number; maxTokens?: number }) {
+	private async updateSettings(payload: { baseUrl?: string; temperature?: number; topP?: number; maxTokens?: number; embeddingModel?: string }) {
 		if (payload.baseUrl !== undefined) {
 			this.ollamaBase = payload.baseUrl;
+			if (this.contextManager) {
+				this.contextManager.embedder.setBaseUrl(this.ollamaBase);
+			}
 		}
 		if (payload.temperature !== undefined) {
 			this.temperature = payload.temperature;
@@ -469,6 +551,14 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		if (payload.maxTokens !== undefined) {
 			this.maxTokens = payload.maxTokens;
+		}
+		if (payload.embeddingModel !== undefined) {
+			this.embeddingModel = payload.embeddingModel;
+			if (this.contextManager) {
+				this.contextManager.setEmbeddingModel(this.embeddingModel);
+				// Triger a re-index if embedding model changed
+				this.contextManager.refreshContext().catch(e => console.error('Re-index failed', e));
+			}
 		}
 		await this.saveSettings();
 		// Reload models if base URL changed
@@ -574,9 +664,90 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 		await this.handleSendWithPrompt(id, enhancedPrompt, filePath);
 	}
 
+	private async createRequestedFiles(payload: { files: Array<{ path: string; content: string; exists?: boolean }> }) {
+		const results = [];
+		// Only create files that don't exist OR if user forced it (though UI should prevent it)
+		for (const file of payload.files) {
+			if (file.exists) {
+				results.push(`Skipped ${file.path} (already exists, use Merge instead)`);
+				continue;
+			}
+			try {
+				const fullPath = path.isAbsolute(file.path) ? file.path : path.join(vscode.workspace.workspaceFolders![0].uri.fsPath, file.path);
+				const uri = vscode.Uri.file(fullPath);
+
+				// Create directory if it doesn't exist
+				await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(fullPath)));
+
+				const enc = new TextEncoder();
+				await vscode.workspace.fs.writeFile(uri, enc.encode(file.content));
+				results.push(`Created ${file.path}`);
+
+				// Open the file
+				const doc = await vscode.workspace.openTextDocument(uri);
+				await vscode.window.showTextDocument(doc, { preview: false });
+			} catch (e) {
+				results.push(`Failed to create ${file.path}: ${e}`);
+			}
+		}
+		vscode.window.showInformationMessage(results.join('\n'));
+	}
+
+	private async handleMergeFile(id: string, filePath: string, newContent: string) {
+		try {
+			const fullPath = path.isAbsolute(filePath) ? filePath : path.join(vscode.workspace.workspaceFolders![0].uri.fsPath, filePath);
+			let original = '';
+			if (fs.existsSync(fullPath)) {
+				original = fs.readFileSync(fullPath, 'utf8');
+			}
+
+			this.post({
+				type: 'codeAvailable',
+				id,
+				filePath: fullPath,
+				code: newContent,
+				original: original
+			});
+			// allow-any-unicode-next-line
+			this.post({ type: 'status', message: `Prepared merge for ${path.basename(filePath)}. Review below.`, statusType: 'info' });
+		} catch (e) {
+			// allow-any-unicode-next-line
+			this.post({ type: 'status', message: `Failed to prepare merge: ${e}`, statusType: 'error' });
+		}
+	}
+
 	private async handleSendWithPrompt(id: string, prompt: string, targetFile?: string) {
 		try {
 			const model = this.selectedModel;
+			// eslint-disable-next-line local/code-no-unexternalized-strings
+			const contextBlock = this.contextManager?.getContextString() || "";
+
+			const systemInstruction = `You are Orbit AI, an expert software engineer.
+			Follow these rules strictly:
+			1. Refer to the PROJECT CONTEXT below for technology stack, naming conventions, and best practices.
+			2. If you need to create NEW files (e.g., test cases, utilities), ONLY use this exact format at the very end of your response:
+			[CREATE_FILES]
+			{
+			"files": [
+				{ "path": "path/to/file.py", "content": "file content here with \\n for new lines" }
+			]
+			}
+			[/CREATE_FILES]
+
+			IMPORTANT:
+			- The content in the JSON MUST be a standard JSON string.
+			- DO NOT use triple quotes (\"\"\") inside the JSON.
+			- Escape all special characters: newlines as \\n, quotes as \\\", and backslashes as \\\\.
+			3. Use the coding standards found in the context. If none are specified, use modern clean code principles.
+
+			PROJECT CONTEXT:
+			${contextBlock}
+			`;
+
+			const messages = [
+				{ role: 'system', content: systemInstruction },
+				{ role: 'user', content: prompt }
+			];
 
 			// Check if Ollama server is reachable
 			try {
@@ -596,15 +767,16 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					model: model,
-					messages: [{ role: 'user', content: prompt }],
+					messages: messages,
 					stream: true,
+					think: true, // Enable native thinking support for models that support it
 					options: {
 						temperature: this.temperature,
 						top_p: this.topP,
 						num_predict: this.maxTokens
 					}
 				}),
-				signal: AbortSignal.timeout(120000)
+				signal: AbortSignal.timeout(300000) // Increase timeout to 5 minutes for slow thinking models
 			});
 
 			if (response.status === 404) {
@@ -625,6 +797,9 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 			let fullResponse = '';
 			let promptTokens = 0;
 			let completionTokens = 0;
+			let isThinking = false;
+			let isNativeThinking = false; // New flag to distinguish modes
+			let currentThinkingText = '';
 
 			try {
 				while (true) {
@@ -639,9 +814,74 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 						if (!line.trim()) { continue; }
 						try {
 							const json = JSON.parse(line);
-							if (json.message?.content) {
-								fullResponse += json.message.content;
-								this.post({ type: 'streamDelta', id, text: json.message.content });
+
+							// BIFURCATED LOGGING FOR DEBUGGING
+							// Check for 'thinking' (Ollama native), 'reasoning' (common), or 'reasoning_content' (OpenAI-compatible)
+							const reasoning = json.message?.thinking || json.message?.reasoning || json.message?.reasoning_content;
+							const content = json.message?.content;
+
+							if (reasoning) {
+								// allow-any-unicode-next-line
+								console.log('🤔 [THINK STREAM]:', reasoning);
+
+								if (!isThinking) {
+									isThinking = true;
+									isNativeThinking = true;
+									this.post({ type: 'thinkingStart', id });
+								}
+								currentThinkingText += reasoning;
+								this.post({ type: 'thinkingUpdate', id, text: reasoning });
+								continue;
+							}
+
+							if (content) {
+								// allow-any-unicode-next-line
+								console.log('💬 [CONTENT STREAM]:', content);
+
+								// IF WE WERE THINKING NATIVELY AND GET CONTENT, CLOSE THINKING BOX
+								if (isThinking && isNativeThinking && !content.includes('<think>')) {
+									isThinking = false;
+									isNativeThinking = false;
+									this.post({ type: 'thinkingEnd', id });
+								}
+
+								// DETECT THINKING TAGS (Fallback/Legacy support)
+								if (content.includes('<think>')) {
+									if (!isThinking) {
+										isThinking = true;
+										isNativeThinking = false;
+										this.post({ type: 'thinkingStart', id });
+									}
+									const afterStart = content.split('<think>')[1];
+									if (afterStart) {
+										currentThinkingText += afterStart;
+										this.post({ type: 'thinkingUpdate', id, text: afterStart });
+									}
+									continue;
+								}
+
+								if (isThinking && !isNativeThinking && content.includes('</think>')) {
+									isThinking = false;
+									const parts = content.split('</think>');
+									if (parts[0]) {
+										currentThinkingText += parts[0];
+										this.post({ type: 'thinkingUpdate', id, text: parts[0] });
+									}
+									this.post({ type: 'thinkingEnd', id });
+									if (parts[1]) {
+										fullResponse += parts[1];
+										this.post({ type: 'streamDelta', id, text: parts[1] });
+									}
+									continue;
+								}
+
+								if (isThinking) {
+									currentThinkingText += content;
+									this.post({ type: 'thinkingUpdate', id, text: content });
+								} else {
+									fullResponse += content;
+									this.post({ type: 'streamDelta', id, text: content });
+								}
 							}
 							// Track token usage from the final response chunk
 							if (json.prompt_eval_count !== undefined) {
@@ -686,11 +926,55 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 				this.postTokenUsage();
 			}
 
+			// SAVE TO HISTORY
+			const promptIndex = this.chatHistory.findIndex(m => m.id === id + '_user');
+			if (promptIndex === -1) {
+				this.chatHistory.push({ role: 'user', text: prompt, id: id + '_user' });
+			}
+			this.chatHistory.push({ role: 'assistant', text: fullResponse, id: id });
+			await this.saveSettings();
+
+			// CHECK FOR FILE CREATION REQUESTS
+			// Find the content between tags (handled flexibly for LLM variations)
+			const creationRegex = /(?:\[CREATE_FILES\]|###\s*CREATE_FILES|CREATE_FILES:)\s*([\s\S]*?)(?:\[\/CREATE_FILES\]|<\/CREATE_FILES>)/i;
+			const jsonMatch = fullResponse.match(creationRegex);
+
+			if (jsonMatch) {
+				try {
+					const jsonStr = jsonMatch[1].trim();
+					const creationData = this.robustParseJSON(jsonStr);
+					if (creationData && creationData.files) {
+						// Check if any of these files already exist
+						creationData.files = creationData.files.map((f: any) => {
+							const fullPath = path.isAbsolute(f.path) ? f.path : path.join(vscode.workspace.workspaceFolders![0].uri.fsPath, f.path);
+							return { ...f, exists: fs.existsSync(fullPath) };
+						});
+
+						this.post({
+							type: 'createRequest',
+							id,
+							files: creationData.files
+						});
+					}
+				} catch (e) {
+					console.error('Failed to parse file creation JSON', e);
+					// allow-any-unicode-next-line
+					this.post({ type: 'status', message: '❌ AI suggested file creation but the configuration was invalid.', statusType: 'error' });
+				}
+			}
+
 			// If this was a code suggestion, extract and offer to apply
 			if (targetFile && fullResponse.includes('```')) {
 				const codeMatch = fullResponse.match(/```(?:\w+)?\n([\s\S]*?)```/);
 				if (codeMatch) {
-					const original = (() => { try { return targetFile ? fs.readFileSync(targetFile, 'utf8') : null; } catch (e) { console.warn('Failed to read original file for diff', e); return null; } })();
+					const original = (() => {
+						try {
+							return targetFile ? fs.readFileSync(targetFile, 'utf8') : null;
+						} catch (e) {
+							console.warn('Failed to read original file for diff', e);
+							return null;
+						}
+					})();
 					this.post({
 						type: 'codeAvailable',
 						id,
@@ -704,6 +988,59 @@ class OllamaChatViewProvider implements vscode.WebviewViewProvider {
 			console.error('Error:', err);
 			const errorMsg = err.message || String(err);
 			this.post({ type: 'streamError', id, error: errorMsg });
+		}
+	}
+
+	private robustParseJSON(str: string): any {
+		let cleaned = str.trim();
+
+		// 1. Handle common Ollama/LLM "markdown JSON" wrapping
+		cleaned = cleaned.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+
+		// 2. Fix triple quotes (Python-style) inside JSON strings
+		cleaned = cleaned.replace(/"""([\s\S]*?)"""/g, (_, p1) => {
+			return JSON.stringify(p1);
+		});
+
+		// 3. Fix missing commas between objects in array
+		cleaned = cleaned.replace(/}\s*{/g, '},{');
+
+		// 4. Fix trailing commas
+		cleaned = cleaned.replace(/,\s*([\]}])/g, '$1');
+
+		// 5. Attempt standard parse
+		try {
+			return JSON.parse(cleaned);
+		} catch (e) {
+			// 6. Aggressive newline/quote fix for "content"
+			try {
+				const fixed = cleaned.replace(/"content":\s*"([\s\S]*?)"(?=\s*[,}\]])/g, (_, p1) => {
+					return `"content": ${JSON.stringify(p1)}`;
+				});
+				return JSON.parse(fixed);
+			} catch (e2) {
+				console.warn('[Ollama] JSON fix failed, trying regex fallback...');
+
+				// 7. FINAL FALLBACK: Regex extraction (skips JSON structure entirely)
+				const files: any[] = [];
+				// This looks for pairs of "path": "..." and "content": "..."
+				const paths = [...cleaned.matchAll(/"path":\s*"([^"]+)"/g)].map(m => m[1]);
+
+				// Match content - this is tricky, so we'll look for everything between "content" and the next property or end
+				const contents = [...cleaned.matchAll(/"content":\s*(?:"|""")([\s\S]*?)(?:"|""")(?=\s*[,}]|$)/g)].map(m => m[1]);
+
+				for (let i = 0; i < Math.min(paths.length, contents.length); i++) {
+					files.push({
+						path: paths[i],
+						content: contents[i].replace(/\\n/g, '\n').replace(/\\"/g, '"')
+					});
+				}
+
+				if (files.length > 0) {
+					return { files };
+				}
+				throw e; // Throw original error
+			}
 		}
 	}
 

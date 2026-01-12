@@ -60,9 +60,33 @@ const settingsCancel = document.getElementById('settingsCancel');
 
 let currentAssistantId = null;
 let currentAssistantEl = null;
-let currentCodeData = null;
+let currentThinkingEl = null;
+let thinkingStartTimestamp = 0;
+let thinkingInterval = null;
+const pendingThinkingBlocks = new Map(); // Store thinking blocks before assistant ID is known
+const currentCodeData = null;
 let selectedFilePath = '';
 let selectedFileName = '';
+let lastEmbeddingModel = '';
+const codeDataMap = new Map(); // Store code data per message ID
+const originalContents = new Map(); // Store original content for undo
+
+// allow-any-unicode-next-line
+console.log('Webview: Initialization started');
+
+// Load initial state if available to prevent flickering
+const previousState = vscode.getState();
+if (previousState) {
+	if (previousState.models) {
+		updateModelsUi(previousState.models, previousState.selectedModel, previousState.embeddingModel);
+	}
+	if (previousState.files) {
+		updateFilesUi(previousState.files, previousState.selectedFile);
+	}
+}
+
+// Signal ready to extension to get fresh/persisted data
+vscode.postMessage({ command: 'ready' });
 
 // ============================================================================
 // Status and Error Handling
@@ -89,6 +113,34 @@ function showSuccess(msg) {
 	console.log('✅ Success:', msg);
 	// allow-any-unicode-next-line
 	showStatus('✅ ' + msg, 'success');
+}
+
+function createThinkingBlock(parent) {
+	const block = document.createElement('div');
+	block.className = 'thinking-block';
+
+	const header = document.createElement('div');
+	header.className = 'thinking-header';
+	// allow-any-unicode-next-line
+	header.innerHTML = `<span>Thinking</span><span class="timer">00:00</span><span class="arrow">▼</span>`;
+	header.onclick = () => block.classList.toggle('collapsed');
+
+	const content = document.createElement('div');
+	content.className = 'thinking-content';
+
+	// Smart scroll state: detect if user manually scrolled up
+	content.isUserScrolling = false;
+	content.onscroll = () => {
+		const threshold = 30; // pixels from bottom
+		const isNearBottom = content.scrollHeight - content.scrollTop - content.clientHeight < threshold;
+		content.isUserScrolling = !isNearBottom;
+	};
+
+	block.appendChild(header);
+	block.appendChild(content);
+	parent.prepend(block);
+
+	return content;
 }
 
 // Process indicator for backend operations
@@ -226,10 +278,11 @@ settingsSave.addEventListener('click', () => {
 	const temperature = parseFloat(document.getElementById('settingTemperature').value);
 	const topP = parseFloat(document.getElementById('settingTopP').value);
 	const maxTokens = parseInt(document.getElementById('settingMaxTokens').value);
+	const embeddingModel = document.getElementById('settingEmbeddingModel').value;
 
 	vscode.postMessage({
 		command: 'updateSettings',
-		payload: { baseUrl, temperature, topP, maxTokens }
+		payload: { baseUrl, temperature, topP, maxTokens, embeddingModel }
 	});
 
 	settingsModal.classList.remove('active');
@@ -277,33 +330,34 @@ function renderModelDetails(model) {
 // Message handling
 window.addEventListener('message', (event) => {
 	const msg = event.data;
+	// allow-any-unicode-next-line
+	console.log('Webview: Received message', msg.type);
 
 	if (msg.type === 'models') {
-		modelSelector.innerHTML = '<option value="">Select a model...</option>';
-		msg.models.forEach(m => {
-			const opt = document.createElement('option');
-			opt.value = m;
-			opt.textContent = m;
-			if (m === msg.selectedModel) { opt.selected = true; }
-			modelSelector.appendChild(opt);
-		});
+		updateModelsUi(msg.models, msg.selectedModel, msg.embeddingModel);
 		modelInfos = msg.modelInfos || {};
 		serverVersion = msg.serverVersion;
 		renderModelDetails(msg.selectedModel);
+
+		// Cache in webview state
+		const currentState = vscode.getState() || {};
+		vscode.setState({
+			...currentState,
+			models: msg.models,
+			selectedModel: msg.selectedModel,
+			embeddingModel: msg.embeddingModel
+		});
 	}
 
 	if (msg.type === 'updateFiles') {
-		fileSelector.innerHTML = '<option value="">No file selected</option>';
-		msg.files.forEach(f => {
-			const opt = document.createElement('option');
-			opt.value = f.path;
-			opt.textContent = `${f.name} (${f.language})`;
-			if (f.path === msg.selectedFile) {
-				opt.selected = true;
-				selectedFilePath = f.path;
-				selectedFileName = f.name;
-			}
-			fileSelector.appendChild(opt);
+		updateFilesUi(msg.files, msg.selectedFile);
+
+		// Cache in webview state
+		const currentState = vscode.getState() || {};
+		vscode.setState({
+			...currentState,
+			files: msg.files,
+			selectedFile: msg.selectedFile
 		});
 	}
 
@@ -312,19 +366,48 @@ window.addEventListener('message', (event) => {
 		selectedFileName = msg.name;
 	}
 
+	if (msg.type === 'restoreChat') {
+		messagesContainer.innerHTML = '';
+		msg.history.forEach(m => {
+			const el = createMessageGroup(m.role, m.id);
+			el.textContent = m.text;
+		});
+		messagesContainer.scrollTop = messagesContainer.scrollHeight;
+	}
+
 	if (msg.type === 'addMessage') {
-		// Skip duplicate user message (already shown in sendPrompt)
+		// Skip duplicate user message
 		if (msg.role === 'user') {
-			return;  // User message already displayed in UI
+			return;
 		} else if (msg.role === 'assistant') {
 			currentAssistantId = msg.id;
 			currentAssistantEl = createMessageGroup('assistant', msg.id);
 			currentAssistantEl.textContent = msg.text || '';
+
+			// HIDE assistant box if it's currently empty
+			if (!currentAssistantEl.textContent) {
+				currentAssistantEl.style.display = 'none';
+			}
+
+			currentThinkingEl = null;
+
+			// Check if we already have a thinking block for this message ID (race condition)
+			if (pendingThinkingBlocks.has(msg.id)) {
+				// allow-any-unicode-next-line
+				console.log('🔗 Linking pending thinking block to message', msg.id);
+				currentThinkingEl = pendingThinkingBlocks.get(msg.id);
+				currentAssistantEl.parentElement.prepend(currentThinkingEl.parentElement);
+				pendingThinkingBlocks.delete(msg.id);
+			}
 		}
 	}
 
 	if (msg.type === 'streamDelta') {
 		if (currentAssistantEl && currentAssistantId === msg.id) {
+			// Ensure box is visible when actual content starts arriving
+			if (currentAssistantEl.style.display === 'none') {
+				currentAssistantEl.style.display = 'block';
+			}
 			currentAssistantEl.textContent += msg.text;
 			messagesContainer.scrollTop = messagesContainer.scrollHeight;
 		}
@@ -332,23 +415,173 @@ window.addEventListener('message', (event) => {
 
 	if (msg.type === 'thinkingStart') {
 		// allow-any-unicode-next-line
-		showStatus(msg.message || '🤔 Model is thinking...', 'info');
+		console.log('🧠 Thinking Start for', msg.id);
+		if (currentAssistantEl && currentAssistantId === msg.id) {
+			const parent = currentAssistantEl.parentElement;
+			currentThinkingEl = createThinkingBlock(parent);
+		} else {
+			const tempParent = document.createElement('div');
+			const blockContent = createThinkingBlock(tempParent);
+			pendingThinkingBlocks.set(msg.id, blockContent);
+		}
+
+		// START TIMER
+		thinkingStartTimestamp = Date.now();
+		if (thinkingInterval) { clearInterval(thinkingInterval); }
+		thinkingInterval = setInterval(() => {
+			const elapsed = Date.now() - thinkingStartTimestamp;
+			const mins = Math.floor(elapsed / 60000).toString().padStart(2, '0');
+			const secs = Math.floor((elapsed % 60000) / 1000).toString().padStart(2, '0');
+			// Update current block (might be pending or active)
+			const timerEl = (currentThinkingEl ? currentThinkingEl.parentElement : pendingThinkingBlocks.get(msg.id)).querySelector('.timer');
+			if (timerEl) { timerEl.textContent = `${mins}:${secs}`; }
+		}, 1000);
+
+		messagesContainer.scrollTop = messagesContainer.scrollHeight;
 	}
 
 	if (msg.type === 'thinkingUpdate') {
-		// Update status with thinking progress
-		// allow-any-unicode-next-line
-		const thinkingStatus = msg.text ? `🤔 Thinking: ${msg.text.substring(0, 50)}...` : '🤔 Model is thinking...';
-		showStatus(thinkingStatus, 'info');
+		if (!currentThinkingEl && currentAssistantEl) {
+			currentThinkingEl = createThinkingBlock(currentAssistantEl.parentElement);
+		}
+
+		if (currentThinkingEl) {
+			currentThinkingEl.textContent += msg.text;
+
+			// AUTO SCROLL if user hasn't scrolled up
+			if (!currentThinkingEl.isUserScrolling) {
+				currentThinkingEl.scrollTop = currentThinkingEl.scrollHeight;
+			}
+
+			messagesContainer.scrollTop = messagesContainer.scrollHeight;
+		} else {
+			// Second Fallback to status
+			// allow-any-unicode-next-line
+			const thinkingStatus = msg.text ? `🤔 Thinking: ${msg.text.substring(0, 50)}...` : '🤔 Model is thinking...';
+			showStatus(thinkingStatus, 'info');
+		}
 	}
 
 	if (msg.type === 'thinkingEnd') {
+		if (thinkingInterval) {
+			clearInterval(thinkingInterval);
+			thinkingInterval = null;
+		}
+
+		if (currentThinkingEl) {
+			const block = currentThinkingEl.parentElement;
+			block.classList.add('collapsed');
+			currentThinkingEl = null; // Clear active thinking reference
+		}
+
+		// SHOW the assistant box now that thinking is over
+		if (currentAssistantEl) {
+			currentAssistantEl.style.display = 'block';
+		}
+
 		// Clear thinking status after a delay
 		setTimeout(() => {
 			if (statusEl && (statusEl.textContent.includes('Thinking') || statusEl.textContent.includes('analyzing'))) {
 				statusEl.style.display = 'none';
 			}
 		}, 1000);
+	}
+
+	if (msg.type === 'createRequest') {
+		if (currentAssistantEl) {
+			const parent = currentAssistantEl.parentElement;
+
+			// Clean up the text by removing the raw JSON block and any variety of tags
+			let text = currentAssistantEl.textContent || '';
+			const cleanRegex = /(?:\[CREATE_FILES\]|###\s*CREATE_FILES|CREATE_FILES:|\[\/CREATE_FILES\]|<\/CREATE_FILES>)/gi;
+			text = text.split(/\[CREATE_FILES\]|###\s*CREATE_FILES|CREATE_FILES:/i)[0].trim();
+			currentAssistantEl.textContent = text;
+
+			const container = document.createElement('div');
+			container.className = 'create-files-request';
+			container.style.marginTop = '12px';
+			container.style.padding = '12px';
+			container.style.border = '1px dashed var(--vscode-button-background)';
+			container.style.borderRadius = '6px';
+			container.style.backgroundColor = 'rgba(0,0,0,0.1)';
+
+			const title = document.createElement('div');
+			title.style.fontWeight = 'bold';
+			// allow-any-unicode-next-line
+			title.textContent = '📂 New File Creation Request';
+			container.appendChild(title);
+
+			const list = document.createElement('div');
+			list.style.margin = '8px 0';
+			list.style.fontSize = '0.9em';
+
+			let hasNewFiles = false;
+			msg.files.forEach(f => {
+				const item = document.createElement('div');
+				item.style.display = 'flex';
+				item.style.justifyContent = 'space-between';
+				item.style.alignItems = 'center';
+				item.style.margin = '4px 0';
+
+				const pathSpan = document.createElement('span');
+				pathSpan.textContent = `• ${f.path}`;
+				if (f.exists) {
+					pathSpan.style.color = 'var(--vscode-charts-orange)';
+					pathSpan.textContent += ' (Exists)';
+				} else {
+					hasNewFiles = true;
+				}
+				item.appendChild(pathSpan);
+
+				if (f.exists) {
+					const mergeBtn = document.createElement('button');
+					mergeBtn.textContent = 'Merge';
+					mergeBtn.style.padding = '2px 8px';
+					mergeBtn.style.fontSize = '10px';
+					mergeBtn.onclick = () => {
+						vscode.postMessage({
+							command: 'mergeFile',
+							payload: { id: msg.id, path: f.path, content: f.content }
+						});
+						item.style.opacity = '0.5';
+						mergeBtn.disabled = true;
+					};
+					item.appendChild(mergeBtn);
+				}
+				list.appendChild(item);
+			});
+			container.appendChild(list);
+
+			const btnContainer = document.createElement('div');
+			btnContainer.style.display = 'flex';
+			btnContainer.style.gap = '8px';
+
+			const createBtn = document.createElement('button');
+			createBtn.textContent = 'Create Files';
+			if (!hasNewFiles) {
+				createBtn.disabled = true;
+				createBtn.style.opacity = '0.5';
+				createBtn.title = 'All suggested files already exist. Use Merge for each file instead.';
+			}
+			createBtn.onclick = () => {
+				vscode.postMessage({
+					command: 'createFiles',
+					payload: { files: msg.files }
+				});
+				container.remove();
+			};
+
+			const cancelBtn = document.createElement('button');
+			cancelBtn.textContent = 'Cancel';
+			cancelBtn.className = 'secondary';
+			cancelBtn.onclick = () => container.remove();
+
+			btnContainer.appendChild(createBtn);
+			btnContainer.appendChild(cancelBtn);
+			container.appendChild(btnContainer);
+
+			parent.appendChild(container);
+		}
 	}
 
 	if (msg.type === 'status') {
@@ -362,86 +595,63 @@ window.addEventListener('message', (event) => {
 	}
 
 	if (msg.type === 'codeAvailable') {
-		currentCodeData = {
+		const codeData = {
 			filePath: msg.filePath,
 			code: msg.code,
 			original: msg.original,
 			diff: msg.diff,
 			operations: msg.operations || []
 		};
+		codeDataMap.set(msg.id, codeData);
 
 		if (currentAssistantEl) {
 			const parent = currentAssistantEl.parentElement;
 
 			// Keep the explanation text but remove the code block from it
-			// if we're showing it as a diff. This ensures explanation is in one div
-			// and the code changes (in the diff view) are in another.
 			let text = currentAssistantEl.textContent || '';
 			if (text.includes('```')) {
-				// We use a regex to strip out the code blocks from the explanation text
-				// as they will be displayed more beautifully in the diff container below.
 				const parts = text.split(/```[\s\S]*?```/);
 				text = parts.filter(p => p.trim().length > 0).join('\n\n').trim();
 				currentAssistantEl.textContent = text;
 			}
 
-			// If no explanation is left (e.g., model only sent code), show nothing in the text div
-			// to avoid a "blank box" with padding.
 			if (!text || text.trim().length === 0) {
 				currentAssistantEl.style.display = 'none';
 			} else {
 				currentAssistantEl.style.display = 'block';
 			}
 
-
-			// Create diff view with modern styling
+			// Create diff view
 			const diff = document.createElement('div');
 			diff.className = 'code-diff';
 
-			// If we have a diff, show it; otherwise compute from code
 			let diffLines = [];
 			if (msg.diff) {
-				// Parse unified diff format
 				diffLines = parseUnifiedDiff(msg.diff);
 			} else if (msg.original && msg.code) {
-				// Compute diff from original and new code
 				diffLines = computeLineDiff(msg.original, msg.code);
 			}
 
-			// Render diff lines with proper styling
 			diffLines.forEach((line, idx) => {
 				const span = document.createElement('span');
 				span.className = 'diff-line';
-
-				// Use actual line number from diff, or fallback to index
 				const displayLineNum = line.lineNumber || (idx + 1);
 				span.setAttribute('data-line-num', displayLineNum);
 
-				// Ensure content is a string
 				let content = typeof line === 'string' ? line : (line.text || String(line));
+				if (line.type === 'added') { span.classList.add('diff-added'); }
+				else if (line.type === 'removed') { span.classList.add('diff-removed'); }
 
-				if (line.type === 'added') {
-					span.classList.add('diff-added');
-				} else if (line.type === 'removed') {
-					span.classList.add('diff-removed');
-				}
-
-				// Handle diff prefix characters
 				if (typeof content === 'string') {
-					if (content.startsWith('+') && !content.startsWith('+++')) {
-						content = content.substring(1);
-					} else if (content.startsWith('-') && !content.startsWith('---')) {
-						content = content.substring(1);
-					} else if (content.startsWith(' ')) {
-						content = content.substring(1);
-					}
+					if (content.startsWith('+') && !content.startsWith('+++')) { content = content.substring(1); }
+					else if (content.startsWith('-') && !content.startsWith('---')) { content = content.substring(1); }
+					else if (content.startsWith(' ')) { content = content.substring(1); }
 				}
 
 				span.textContent = content;
 				diff.appendChild(span);
 			});
 
-			// Create wrapper for buttons with better styling
 			const actionsWrapper = document.createElement('div');
 			actionsWrapper.style.padding = '12px 16px';
 			actionsWrapper.style.borderTop = '1px solid var(--border)';
@@ -455,12 +665,14 @@ window.addEventListener('message', (event) => {
 			// allow-any-unicode-next-line
 			applyBtn.textContent = '✓ Apply Changes';
 			applyBtn.dataset.action = 'apply';
+			applyBtn.className = 'apply-btn';
 			applyBtn.style.flex = '1';
 
 			const discardBtn = document.createElement('button');
 			// allow-any-unicode-next-line
 			discardBtn.textContent = '✗ Discard';
 			discardBtn.dataset.action = 'discard';
+			discardBtn.className = 'discard-btn';
 
 			actions.appendChild(applyBtn);
 			actions.appendChild(discardBtn);
@@ -486,17 +698,14 @@ window.addEventListener('message', (event) => {
 
 	if (msg.type === 'fileWriteSuccess') {
 		showStatus('✓ Code applied successfully!', 'success');
-		currentCodeData = null;
 	}
 
 	if (msg.type === 'applyCodeSuccess') {
 		showStatus(msg.message, 'success');
-		currentCodeData = null;
 	}
 
 	if (msg.type === 'applyCodeError') {
 		showError(msg.error);
-		currentCodeData = null;
 	}
 
 	if (msg.type === 'tokenUsage') {
@@ -511,22 +720,35 @@ window.addEventListener('message', (event) => {
 		document.getElementById('settingTemperature').value = msg.temperature || 0.7;
 		document.getElementById('settingTopP').value = msg.topP || 0.9;
 		document.getElementById('settingMaxTokens').value = msg.maxTokens || 2048;
+		lastEmbeddingModel = msg.embeddingModel || '';
+		const embeddingSelector = document.getElementById('settingEmbeddingModel');
+		if (embeddingSelector) {
+			embeddingSelector.value = lastEmbeddingModel;
+		}
 	}
 });
 
 // Event delegation for code action buttons
 messagesContainer.addEventListener('click', (e) => {
 	if (e.target.dataset.action === 'apply') {
-		if (!currentCodeData || !currentCodeData.filePath) { return; }
+		const parent = e.target.closest('.message-group');
+		if (!parent) { return; }
 
-		// Validate that we have something to apply (operations, diff, or code)
-		if (!Array.isArray(currentCodeData.operations)) {
-			currentCodeData.operations = [];
+		const msgId = parent.dataset.id;
+		const codeData = codeDataMap.get(msgId);
+		if (!codeData || !codeData.filePath) {
+			console.error('No code data for message', msgId);
+			return;
 		}
 
-		const hasOperations = currentCodeData.operations.length > 0;
-		const hasDiff = currentCodeData.diff && currentCodeData.diff.length > 0;
-		const hasCode = currentCodeData.code && currentCodeData.code.length > 0;
+		// Validate that we have something to apply (operations, diff, or code)
+		if (!Array.isArray(codeData.operations)) {
+			codeData.operations = [];
+		}
+
+		const hasOperations = codeData.operations.length > 0;
+		const hasDiff = codeData.diff && codeData.diff.length > 0;
+		const hasCode = codeData.code && codeData.code.length > 0;
 
 		if (!hasOperations && !hasDiff && !hasCode) {
 			console.error('Apply failed: no changes available');
@@ -538,30 +760,72 @@ messagesContainer.addEventListener('click', (e) => {
 		const applyMessage = {
 			command: 'writeToFile',
 			payload: {
-				filePath: currentCodeData.filePath,
-				operations: currentCodeData.operations,
-				diff: currentCodeData.diff,
-				original: currentCodeData.original,
-				code: currentCodeData.code
+				filePath: codeData.filePath,
+				operations: codeData.operations,
+				diff: codeData.diff,
+				original: codeData.original,
+				code: codeData.code
 			}
 		};
 		// allow-any-unicode-next-line
-		console.log('📤 Sending apply message with', currentCodeData.operations.length, 'operations and fallback diff/code');
+		console.log('📤 Sending apply message with', codeData.operations.length, 'operations and fallback diff/code');
 		vscode.postMessage(applyMessage);
+
+		// HIDE APPLY BUTTON AND CHANGE DISCARD TO UNDO
+		const applyBtn = parent.querySelector('.apply-btn');
+		const discardBtn = parent.querySelector('.discard-btn');
+		if (applyBtn) { applyBtn.style.display = 'none'; }
+		if (discardBtn) {
+			// allow-any-unicode-next-line
+			discardBtn.textContent = '↶ Undo';
+			discardBtn.dataset.action = 'undo';
+			// Store original content for this specific message
+			originalContents.set(msgId, {
+				filePath: codeData.filePath,
+				original: codeData.original
+			});
+		}
 
 		// Show processing status
 		showStatus('Applying changes...', 'info');
-		e.target.disabled = true;
-	} else if (e.target.dataset.action === 'discard') {
-		if (currentCodeData && currentAssistantEl) {
-			const parent = currentAssistantEl.closest('.message-group');
-			if (parent) {
-				const diff = parent.querySelector('.code-diff');
-				const actions = parent.querySelector('.code-action-buttons');
-				if (diff) { diff.remove(); }
-				if (actions) { actions.remove(); }
+	} else if (e.target.dataset.action === 'undo') {
+		const parent = e.target.closest('.message-group');
+		if (parent && originalContents.has(parent.dataset.id)) {
+			const { filePath, original } = originalContents.get(parent.dataset.id);
+
+			// Send undo message (just write original back)
+			vscode.postMessage({
+				command: 'writeToFile',
+				payload: {
+					filePath: filePath,
+					code: original // Write back the original content
+				}
+			});
+
+			// RESTORE BUTTONS
+			const applyBtn = parent.querySelector('.apply-btn');
+			const discardBtn = parent.querySelector('.discard-btn');
+			if (applyBtn) { applyBtn.style.display = 'inline-block'; }
+			if (discardBtn) {
+				// allow-any-unicode-next-line
+				discardBtn.textContent = '✗ Discard';
+				discardBtn.dataset.action = 'discard';
 			}
-			currentCodeData = null;
+			originalContents.delete(parent.dataset.id);
+			showStatus('Changes reverted', 'info');
+		}
+	} else if (e.target.dataset.action === 'discard') {
+		const parent = e.target.closest('.message-group');
+		if (parent) {
+			const diff = parent.querySelector('.code-diff');
+			const actions = parent.querySelector('.code-action-buttons');
+			const actionsWrapper = actions ? actions.parentElement : null;
+			if (diff) { diff.remove(); }
+			if (actionsWrapper) { actionsWrapper.remove(); }
+
+			const msgId = parent.dataset.id;
+			codeDataMap.delete(msgId);
+			originalContents.delete(msgId);
 		}
 	}
 });
@@ -659,5 +923,54 @@ function parseUnifiedDiff(diffContent) {
 
 	return result;
 }
+
+function updateModelsUi(models, selectedModel, embeddingModel) {
+	if (!modelSelector) { return; }
+	modelSelector.innerHTML = '<option value="">Select a model...</option>';
+	if (models) {
+		models.forEach(m => {
+			const opt = document.createElement('option');
+			opt.value = m;
+			opt.textContent = m;
+			if (m === selectedModel) { opt.selected = true; }
+			modelSelector.appendChild(opt);
+		});
+	}
+	const embeddingSelector = document.getElementById('settingEmbeddingModel');
+	if (embeddingSelector) {
+		embeddingSelector.innerHTML = '<option value="">Select an embedding model...</option>';
+		if (models) {
+			models.forEach(m => {
+				const opt = document.createElement('option');
+				opt.value = m;
+				opt.textContent = m;
+				if (m === embeddingModel || m === lastEmbeddingModel) { opt.selected = true; }
+				embeddingSelector.appendChild(opt);
+			});
+		}
+		// Second pass to ensure value is set if it was added
+		if (embeddingModel) { embeddingSelector.value = embeddingModel; }
+		else if (lastEmbeddingModel) { embeddingSelector.value = lastEmbeddingModel; }
+	}
+}
+
+function updateFilesUi(files, selectedFile) {
+	if (!fileSelector) { return; }
+	fileSelector.innerHTML = '<option value="">No file selected</option>';
+	if (files) {
+		files.forEach(f => {
+			const opt = document.createElement('option');
+			opt.value = f.path;
+			opt.textContent = `${f.name} (${f.language})`;
+			if (f.path === selectedFile) {
+				opt.selected = true;
+				selectedFilePath = f.path;
+				selectedFileName = f.name;
+			}
+			fileSelector.appendChild(opt);
+		});
+	}
+}
+
 
 // allow-any-unicode-next-line

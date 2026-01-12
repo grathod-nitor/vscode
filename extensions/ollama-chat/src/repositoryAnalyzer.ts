@@ -36,10 +36,21 @@ export interface CodingStandards {
 	testFrameworks: string[];
 }
 
-export async function analyzeRepository(rootPath: string): Promise<RepositoryContext> {
-	const techStack = await detectTechStack(rootPath);
-	const projectStructure = await detectProjectStructure(rootPath);
+export async function analyzeRepository(rootPath: string, llmConfig?: { baseUrl: string; model: string }): Promise<RepositoryContext> {
+	let techStack = await detectTechStack(rootPath);
+	let projectStructure = await detectProjectStructure(rootPath);
 	const codingStandards = await detectCodingStandards(rootPath, techStack.dependencies);
+
+	// If LLM is available, use it to refine the analysis
+	if (llmConfig && llmConfig.model) {
+		try {
+			const refined = await refineAnalysisWithLLM(rootPath, techStack, projectStructure, llmConfig);
+			techStack = refined.techStack;
+			projectStructure = refined.projectStructure;
+		} catch (e) {
+			console.error('Ollama: LLM Refinement failed', e);
+		}
+	}
 
 	return {
 		projectName: path.basename(rootPath),
@@ -48,6 +59,62 @@ export async function analyzeRepository(rootPath: string): Promise<RepositoryCon
 		projectStructure,
 		codingStandards,
 		timestamp: new Date().toISOString()
+	};
+}
+
+async function refineAnalysisWithLLM(rootPath: string, currentStack: TechStackInfo, currentStruct: ProjectStructure, config: { baseUrl: string; model: string }) {
+	// Gather more context for the LLM
+	const files = await vscode.workspace.findFiles('**/*.{py,ts,js,go,rs,java,toml,yaml,json}', '**/node_modules/**', 20);
+	let fileContext = 'Top level files and their content snippets:\n';
+
+	for (const file of files.slice(0, 10)) {
+		try {
+			const content = fs.readFileSync(file.fsPath, 'utf8').substring(0, 2000);
+			fileContext += `\nFile: ${path.relative(rootPath, file.fsPath)}\nContent:\n${content}\n---\n`;
+		} catch (e) { }
+	}
+
+	const prompt = `Observe the following project files and structure. Provide a JSON summary of the project.
+	Current Detection:
+	Languages: ${currentStack.languages.join(', ')}
+	Frameworks: ${currentStack.frameworks.join(', ')}
+
+	Files Context:
+	${fileContext}
+
+	Respond ONLY with a JSON object in this format:
+	{
+	"techStack": { "languages": [], "frameworks": [], "buildTools": [] },
+	"projectStructure": { "patterns": [], "layers": [] }
+	}`;
+
+	const response = await fetch(`${config.baseUrl}/api/generate`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			model: config.model,
+			prompt: prompt,
+			stream: false,
+			format: 'json'
+		})
+	});
+
+	if (!response.ok) { throw new Error('LLM analysis failed'); }
+	const data = await response.json() as { response: string };
+	const result = JSON.parse(data.response);
+
+	return {
+		techStack: {
+			...currentStack,
+			languages: Array.from(new Set([...currentStack.languages, ...(result.techStack?.languages || [])])),
+			frameworks: Array.from(new Set([...currentStack.frameworks, ...(result.techStack?.frameworks || [])])),
+			buildTools: Array.from(new Set([...currentStack.buildTools, ...(result.techStack?.buildTools || [])]))
+		},
+		projectStructure: {
+			...currentStruct,
+			patterns: Array.from(new Set([...currentStruct.patterns, ...(result.projectStructure?.patterns || [])])),
+			layers: Array.from(new Set([...currentStruct.layers, ...(result.projectStructure?.layers || [])]))
+		}
 	};
 }
 
@@ -109,7 +176,20 @@ async function detectProjectStructure(rootPath: string): Promise<ProjectStructur
 	const struct: ProjectStructure = { patterns: [], layers: [], entryPoints: [] };
 
 	// Check directories for Architecture Patterns
-	const dirs = (await fs.promises.readdir(rootPath)).filter(f => fs.statSync(path.join(rootPath, f)).isDirectory());
+	let dirs: string[] = [];
+	try {
+		const items = await fs.promises.readdir(rootPath);
+		dirs = items.filter(f => {
+			try {
+				return fs.statSync(path.join(rootPath, f)).isDirectory();
+			} catch {
+				return false;
+			}
+		});
+	} catch (e) {
+		console.error('Error reading repository root for structure:', e);
+		return struct;
+	}
 
 	if (dirs.includes('src') && dirs.includes('dist')) { struct.patterns.push('Standard Source/Dist'); }
 	if (dirs.includes('controllers') && dirs.includes('models') && dirs.includes('views')) { struct.patterns.push('MVC'); }

@@ -7,8 +7,12 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["AI"],
+  "categories": [
+    "AI"
+  ],
+  "icon": "media/orbit-wheel.png",
   "main": "./out/extension.js",
+  "activationEvents": [],
   "contributes": {
     "commands": [
       {
@@ -18,6 +22,10 @@
       {
         "command": "ollama.suggestChanges",
         "title": "Ollama: Suggest Code Changes"
+      },
+      {
+        "command": "ollama.refreshContext",
+        "title": "Orbit: Refresh Project Context"
       }
     ],
     "viewsContainers": {
@@ -25,7 +33,7 @@
         {
           "id": "ollamaChat",
           "title": "Ollama",
-          "icon": "media/icon.svg"
+          "icon": "media/orbit-wheel.png"
         }
       ]
     },
@@ -34,7 +42,8 @@
         {
           "id": "ollamaChat.view",
           "name": "Chat",
-          "type": "webview"
+          "type": "webview",
+          "icon": "media/orbit-wheel.png"
         }
       ]
     },
